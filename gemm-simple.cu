@@ -2,6 +2,7 @@
 #include <cublas_v2.h>
 #include <stdlib.h>
 #include <cute/tensor.hpp>
+#include <cute/util/gpu_clock.hpp>
 
 template <typename T>
 void gen_rand_data(T *data, int n);
@@ -21,15 +22,24 @@ __global__ void gemm_simple(T *Cptr, const T *Aptr, const T *Bptr, int m, int n,
   Tensor gA = local_tile(A, make_tile(Int<kTileM>{}, Int<kTileK>{}), make_coord(iy, _));
   Tensor gB = local_tile(B, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(ix, _));
   Tensor gC = local_tile(C, make_tile(Int<kTileM>{}, Int<kTileN>{}), make_coord(iy, ix));
-  //  gA(kTileM, kTileK, num_tile_k)
-  //  gB(kTileN, kTileK, num_tile_k)
-  //  gC(kTileM, kTileN) 
-
+  // gA(kTileM, kTileK, num_tile_k) (128, 32, 256 / 32) = (128, 32, 8)
+  // gB(kTileN, kTileK, num_tile_k) (128, 32, 256 / 32) = (128, 32, 8)
+  // gC(kTileM, kTileN) (128, 128) = (128, 128)
   TiledMMA tiled_mma;
   auto thr_mma = tiled_mma.get_slice(threadIdx.x);
-  auto tAgA = thr_mma.partition_A(gA);  // (MMA, MMA_M, MMA_K, num_tile_k)
-  auto tBgB = thr_mma.partition_B(gB);  // (MMA, MMA_N, MMA_K, num_tile_k)
-  auto tCgC = thr_mma.partition_C(gC);  // (MMA, MMA_M, MMA_N)
+  // tiled mma can now deal with problem size (M, N, K) = (32, 16, 16)
+  auto tAgA = thr_mma.partition_A(gA); // (MMA, MMA_M, MMA_K, num_tile_k) (8, 4, 2, 8) = ((2, 2, 2), 128 / 32, 32 / 16, 8)
+  auto tBgB = thr_mma.partition_B(gB); // (MMA, MMA_N, MMA_K, num_tile_k) (4, 8, 2, 8) = ((2, 4, 2), 128 / 16, 32 / 16, 8)
+  auto tCgC = thr_mma.partition_C(gC); // (MMA, MMA_M, MMA_N) (4, 4, 8) = ((2, 2, 2), 128 / 32, 128 / 16)
+  // print the shape of tAgA
+  // printf("tAgA shape = %d %d %d %d\n", size<0>(tAgA), size<1>(tAgA), size<2>(tAgA), size<3>(tAgA));
+  #if 1
+  if (thread0() && block0()) {
+  print("tAgA shape = "); print(tAgA); print("\n");
+  print("tBgB shape = "); print(tBgB); print("\n");
+  print("tCgC shape = "); print(tCgC); print("\n");
+  }
+  #endif
 
   auto tArA = thr_mma.partition_fragment_A(gA(_, _, 0));  // (MMA, MMA_M, MMA_K)
   auto tBrB = thr_mma.partition_fragment_B(gB(_, _, 0));  // (MMA, MMA_N, MMA_K)
@@ -59,9 +69,11 @@ int main() {
   T *Aptr;
   T *Bptr;
 
-  int m = 81920;
-  int n = 256;
-  int k = 256;
+  // for learning purpose, I set the m, n, k the same as the problem size that
+  // a single threadblock can handle
+  int m = 128;
+  int n = 128;
+  int k = 32;
 
   cudaMalloc(&Cptr, sizeof(T) * m * n);
   cudaMalloc(&Aptr, sizeof(T) * m * k);
@@ -82,20 +94,31 @@ int main() {
   using mma_atom = MMA_Atom<mma_traits>;
 
   using MMA = decltype(make_tiled_mma(mma_atom{}, 
-                      make_layout(Shape<_2, _2, _1>{}), 
-                      make_layout(Shape<_1, _2, _1>{})));
+                      make_layout(Shape<_1, _1, _1>{}), 
+                      make_layout(Shape<_1, _1, _1>{})));
+  // MMA mma_tmp;
+  // print_latex(mma_tmp);
   constexpr int kTileM = 128; 
   constexpr int kTileN = 128; 
   constexpr int kTileK = 32; 
 
   dim3 block(size(MMA{}));
   dim3 grid(n / kTileN, m / kTileM);
-  for (int i = 0; i < 100; ++i) {
+  
+  // cute gemm
+  GPU_Clock timer;
+  int num_iter = 1;
+  timer.start();
+
+  for (int i = 0; i < num_iter; ++i) {
     gemm_simple<T, kTileM, kTileN, kTileK, MMA><<<grid, block>>>(Cptr, Aptr, Bptr, m, n, k);
   }
   cudaDeviceSynchronize();
+
+  double elapsed_time_ms = timer.seconds() / num_iter * 1000;
+  printf("elapsed time cute = %f ms\n", elapsed_time_ms);
   auto err = cudaGetLastError();
-  printf("err = %d, str = %s\n", err, cudaGetErrorString(err));
+  if (err) printf("err = %d, str = %s\n", err, cudaGetErrorString(err));
 
   // cublas
   T *Cptr_cublas;
@@ -107,7 +130,8 @@ int main() {
 
   half alpha = half(1.f);
   half beta = half(0.f);
-  for (int i = 0; i < 100; ++i) {
+  timer.start();
+  for (int i = 0; i < num_iter; ++i) {
     cublasStatus_t ret = cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
           	  n, m, k,
           	  &alpha,
@@ -121,8 +145,10 @@ int main() {
   }
 
   cudaDeviceSynchronize();
+  elapsed_time_ms = timer.seconds() / num_iter * 1000;
+  printf("elapsed time cublas = %f ms\n", elapsed_time_ms);
   err = cudaGetLastError();
-  printf("err = %d, str = %s\n", err, cudaGetErrorString(err));
+  if (err) printf("err = %d, str = %s\n", err, cudaGetErrorString(err));
 
   T *Cptr_host;
   T *Cptr_cublas_host;
@@ -139,7 +165,7 @@ int main() {
     float v1 = Cptr_host[i];
     float v2 = Cptr_cublas_host[i];
     if (fabs(v2 - v1) > threshold) {
-      printf("v1 = %f, v2 = %f\n", v1, v2);
+      printf("NOT EQUAL: v1 = %f, v2 = %f\n", v1, v2);
     }
   }
 
@@ -151,8 +177,8 @@ int main() {
   Tensor tc1 = local_tile(tensor_C, tile, coor);
   Tensor tc1_cublas = local_tile(tensor_C_cublas, tile, coor);
 
-  print_tensor(tc1);
-  print_tensor(tc1_cublas);
+  // print_tensor(tc1);
+  // print_tensor(tc1_cublas);
 }
 
 template <typename T>

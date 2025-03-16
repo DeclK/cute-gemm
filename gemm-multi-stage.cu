@@ -5,8 +5,8 @@
 
 #include <cute/tensor.hpp>
 
-#include "detail/cublaslt-gemm.h"
 #include "detail/data.h"
+#include <cute/util/gpu_clock.hpp>
 
 template <typename Config>
 __global__ void /* __launch_bounds__(128, 1) */
@@ -326,13 +326,11 @@ int main(int argc, char *argv[]) {
   printf("cuBLAS version: %d\n", cublas_version);
 
   // default;
-  int M = 81920;
-  int N = 256;
-  int K = 256;
+  int M = 5120;
+  int N = 5120;
+  int K = 4096;
 
-  int enable_cpu = 0;
-  int enable_cublaslt = 1;
-  int nt = 11;
+  int num_iter = 100;
 
   using ComputeType = T;
 
@@ -340,139 +338,103 @@ int main(int argc, char *argv[]) {
   T *Bptr;
   T *Dptr;
   T *Dptr_cublas;
-  T *Dptr_cublaslt;
 
   T *Aptr_host;
   T *Bptr_host;
   T *Dptr_host;
-  T *Dptr_host_cpu;
   T *Dptr_host_blas;
-  T *Dptr_host_cublaslt;
 
+  // allocate memory
   Aptr_host = (T *)malloc(sizeof(T) * M * K);
   Bptr_host = (T *)malloc(sizeof(T) * N * K);
   Dptr_host = (T *)malloc(sizeof(T) * M * N);
 
-  Dptr_host_cpu = (T *)malloc(sizeof(T) * M * N);
   Dptr_host_blas = (T *)malloc(sizeof(T) * M * N);
-  Dptr_host_cublaslt = (T *)malloc(sizeof(T) * M * N);
 
   cudaMalloc(&Aptr, sizeof(T) * M * K);
   cudaMalloc(&Bptr, sizeof(T) * N * K);
   cudaMalloc(&Dptr, sizeof(T) * M * N);
   cudaMalloc(&Dptr_cublas, sizeof(T) * M * N);
-  cudaMalloc(&Dptr_cublaslt, sizeof(T) * M * N);
 
+  // create random tensor on host
   auto tA = make_tensor(Aptr_host, make_shape(M, K), make_stride(K, 1));
   auto tB = make_tensor(Bptr_host, make_shape(N, K), make_stride(K, 1));
   auto tD = make_tensor(Dptr_host, make_shape(M, N), make_stride(N, 1));
-
   cpu_rand_data(&tA);
   cpu_rand_data(&tB);
-
   clear(tD);
 
+  // copy tensor to device
   cudaMemcpy(Aptr, Aptr_host, sizeof(T) * M * K, cudaMemcpyHostToDevice);
   cudaMemcpy(Bptr, Bptr_host, sizeof(T) * N * K, cudaMemcpyHostToDevice);
   cudaMemcpy(Dptr, Dptr_host, sizeof(T) * M * N, cudaMemcpyHostToDevice);
   cudaMemset(Dptr_cublas, 0, sizeof(T) * M * N);
-  cudaMemset(Dptr_cublaslt, 0, sizeof(T) * M * N);
 
-  CublasLtGemm<T, ComputeType> cublaslt_gemm;
-  if (enable_cublaslt) {
-    cublaslt_gemm.init(Dptr_cublaslt, Bptr, Aptr, N, M, K);
-  }
-
+  // gemm config
   config::GemmConfig<T, 128, 128, 32, 3> gemm_config;
-
   print(typename decltype(gemm_config)::MMA{});
 
+  // kernel config
   dim3 block = gemm_config.kThreadNum;
   dim3 grid((N + gemm_config.kTileN - 1) / gemm_config.kTileN,
             (M + gemm_config.kTileM - 1) / gemm_config.kTileM);
   int shm_size = gemm_config.kShmSize;
+  printf("block = (%d, %d), gird = (%d, %d), shm = %d\n", block.x, block.y, grid.x, grid.y, shm_size);
 
   half alpha = 1.f;
   half beta = 0.f;
+  GPU_Clock timer;
 
-  for (int it = 0; it < nt; ++it) {
-    // blas
-    cudaMemset(Dptr_cublas, 0, sizeof(T) * M * N);
+  // cute multi-stage gemm
+  timer.start();
+  for (int it = 0; it < num_iter; ++it) {
+    // cudaMemset(Dptr, 0, sizeof(T) * M * N);
+    cudaFuncSetAttribute(gemm_multi_stage<decltype(gemm_config)>, 
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    gemm_multi_stage<decltype(gemm_config)>
+    <<<grid, block, shm_size>>>(Dptr, Aptr, Bptr, M, N, K);
+  }
+  cudaDeviceSynchronize();
+  double elapsed_time_ms = timer.milliseconds() / num_iter;
+  printf("elapsed time cute = %f ms\n", elapsed_time_ms);
+
+  // blas
+  timer.start();
+  for (int it = 0; it < num_iter; ++it) {
+    // cudaMemset(Dptr_cublas, 0, sizeof(T) * M * N);
     cublasStatus_t ret = cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
                                      &alpha, (half *)Bptr, K, (half *)Aptr, K,
                                      &beta, (half *)Dptr_cublas, N);
-    if (ret != CUBLAS_STATUS_SUCCESS) {
-      printf("cublas err = %d, str = %s\n", ret, cublasGetStatusString(ret));
-    }
-
-    if (enable_cublaslt) {
-      cudaMemset(Dptr_cublaslt, 0, sizeof(T) * M * N);
-      cublaslt_gemm.run();
-    }
-
-    // multi-stage
-    cudaMemset(Dptr, 0, sizeof(T) * M * N);
-    cudaFuncSetAttribute(gemm_multi_stage<decltype(gemm_config)>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-    gemm_multi_stage<decltype(gemm_config)>
-        <<<grid, block, shm_size>>>(Dptr, Aptr, Bptr, M, N, K);
   }
-
-  cudaMemcpy(Dptr_host, Dptr, sizeof(T) * M * N, cudaMemcpyDeviceToHost);
-  cudaMemcpy(Dptr_host_blas, Dptr_cublas, sizeof(T) * M * N,
-             cudaMemcpyDeviceToHost);
-  cudaMemcpy(Dptr_host_cublaslt, Dptr_cublaslt, sizeof(T) * M * N,
-             cudaMemcpyDeviceToHost);
-
   cudaDeviceSynchronize();
-  auto err = cudaGetLastError();
-  printf("block = (%d, %d), gird = (%d, %d), shm = %d\n", block.x, block.y,
-         grid.x, grid.y, shm_size);
+  elapsed_time_ms = timer.milliseconds() / num_iter;
+  printf("elapsed time cublas = %f ms\n", elapsed_time_ms);
 
-  if (err == cudaSuccess) {
-    printf("err = %d, str = %s\n", err, cudaGetErrorString(err));
-  } else {
+  // copy result back to host
+  cudaMemcpy(Dptr_host, Dptr, sizeof(T) * M * N, cudaMemcpyDeviceToHost);
+  cudaMemcpy(Dptr_host_blas, Dptr_cublas, sizeof(T) * M * N, cudaMemcpyDeviceToHost);
+
+  auto err = cudaGetLastError();
+  if (err != cudaSuccess) {
     printf_fail("err = %d, str = %s\n", err, cudaGetErrorString(err));
   }
 
+  // check blas result with cute result
   gpu_compare(Dptr, Dptr_cublas, M * N);
 
-  if (enable_cublaslt) {
-    gpu_compare(Dptr, Dptr_cublaslt, M * N);
-  }
-
+  // show part of the output tensor
   auto tD_host = make_tensor(Dptr_host, make_shape(M, N), make_stride(N, 1));
-  auto tD_host_cpu =
-      make_tensor(Dptr_host_cpu, make_shape(M, N), make_stride(N, 1));
-  auto tD_host_blas =
-      make_tensor(Dptr_host_blas, make_shape(M, N), make_stride(N, 1));
-  auto tD_host_cublaslt =
-      make_tensor(Dptr_host_cublaslt, make_shape(M, N), make_stride(N, 1));
-
-  if (enable_cpu) {
-    cpu_gemm(&tD_host_cpu, tA, tB);
-    cpu_compare(tD_host_cpu, tD_host, 0.1f);
-  }
+  auto tD_host_blas = make_tensor(Dptr_host_blas, make_shape(M, N), make_stride(N, 1));
 
   auto tile = make_tile(min(8, M), min(8, N));
   auto t32x32 = local_tile(tD_host, tile, make_coord(0, 0));
-  auto t32x32_cpu = local_tile(tD_host_cpu, tile, make_coord(0, 0));
   auto t32x32_blas = local_tile(tD_host_blas, tile, make_coord(0, 0));
-  auto t32x32_cublaslt = local_tile(tD_host_cublaslt, tile, make_coord(0, 0));
 
   printf("M = %d, N = %d, K = %d\n", M, N, K);
 
-  printf("our-impl:\n");
-  print_tensor(t32x32);
-  if (enable_cpu) {
-    printf("cpu:\n");
-    print_tensor(t32x32_cpu);
-  }
-  printf("cublas:\n");
-  print_tensor(t32x32_blas);
+  // printf("our-impl:\n");
+  // print_tensor(t32x32);
+  // printf("cublas:\n");
+  // print_tensor(t32x32_blas);
 
-  if (enable_cublaslt) {
-    printf("cublaslt:\n");
-    print_tensor(t32x32_cublaslt);
-  }
 }
