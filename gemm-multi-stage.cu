@@ -53,30 +53,56 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
 
   // slice the tensor to small one which is used for current thread block.
   Tensor gA = local_tile(A, make_tile(Int<kTileM>{}, Int<kTileK>{}),
-                         make_coord(iy, _));  // (kTileM, kTileK, k)
+                         make_coord(iy, _));  // (kTileM, kTileK, k), (128, 32, 1)
   Tensor gB = local_tile(B, make_tile(Int<kTileN>{}, Int<kTileK>{}),
-                         make_coord(ix, _));  // (kTileN, kTileK, k)
+                         make_coord(ix, _));  // (kTileN, kTileK, k), (128, 32, 1)
   Tensor gD = local_tile(D, make_tile(Int<kTileM>{}, Int<kTileN>{}),
-                         make_coord(iy, ix));  // (kTileM, kTileN)
+                         make_coord(iy, ix));  // (kTileM, kTileN), (128, 128)
 
   // shared memory
   auto sA = make_tensor(make_smem_ptr(Ashm),
-                        SmemLayoutA{});  // (kTileM, kTileK, kStage)
+                        SmemLayoutA{});  // (kTileM, kTileK, kStage) (128, 32, 5)
   auto sB = make_tensor(make_smem_ptr(Bshm),
-                        SmemLayoutB{});  // (kTileN, kTileK, kStage)
+                        SmemLayoutB{});  // (kTileN, kTileK, kStage) (128, 32, 5)
 
   // dispatch TileA/TileB/TileC mma tensor into thread fragment via partition
   // method
   TiledMMA tiled_mma;
   auto thr_mma = tiled_mma.get_slice(idx);
-  auto tCrA = thr_mma.partition_fragment_A(gA(_, _, 0));  // (MMA, MMA_M, MMA_K)
-  auto tCrB = thr_mma.partition_fragment_B(gB(_, _, 0));  // (MMA, MMA_N, MMA_K)
-  auto tCrD = thr_mma.partition_fragment_C(gD);           // (MMA, MMA_M, MMA_N)
+  auto tCrA = thr_mma.partition_fragment_A(gA(_, _, 0));  // (MMA, MMA_M, MMA_K), (8, 4, 2) = ((2,2,2), 128/32, 32/16)
+  auto tCrB = thr_mma.partition_fragment_B(gB(_, _, 0));  // (MMA, MMA_N, MMA_K), (4, 8, 2) = ((2,2), 128/16, 32/16)
+  auto tCrD = thr_mma.partition_fragment_C(gD);           // (MMA, MMA_M, MMA_N), (4, 4, 8) = ((2,2), 128/32, 128/16)
+  
+#if 0
+  if (thread0() && block0()) {
+    print("tCrA shape = "); print(tCrA); print("\n");
+    print("tCrB shape = "); print(tCrB); print("\n");
+    print("tCrD shape = "); print(tCrD); print("\n");
+  }
+#endif
 
   // fill zero for accumulator
   clear(tCrD);
 
-  // gmem -cp.async-> shm -ldmatrix-> reg
+  // gmem -cp.async-> shm
+  G2SCopyA g2s_tiled_copy_a;
+  auto g2s_thr_copy_a = g2s_tiled_copy_a.get_slice(idx);
+  auto tAgA_copy = g2s_thr_copy_a.partition_S(gA);  // (CPY, CPY_M, CPY_K, k), (8, 4, 1, 1) = ((8,1), 128/32, 32/32, k)
+  auto tAsA_copy = g2s_thr_copy_a.partition_D(sA);  // (CPY, CPY_M, CPY_K, kStage), (8, 4, 1, 3) = ((8,1), 128/32, 32/32, kStage)
+  
+#if 0
+  if (thread0() && block0()) {
+    print("tAgA_copy shape = "); print(tAgA_copy); print("\n");
+    print("tAsA_copy shape = "); print(tAsA_copy); print("\n");
+  }
+#endif
+
+  G2SCopyB g2s_tiled_copy_b;
+  auto g2s_thr_copy_b = g2s_tiled_copy_b.get_slice(idx);
+  auto tBgB_copy = g2s_thr_copy_b.partition_S(gB);  // (CPY, CPY_N, CPY_K, k)
+  auto tBsB_copy = g2s_thr_copy_b.partition_D(sB);  // (CPY, CPY_N, CPY_K, kStage)
+  
+  // shm -ldmatrix-> reg
   auto s2r_tiled_copy_a = make_tiled_copy_A(S2RCopyAtomA{}, tiled_mma);
   auto s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(idx);
   auto tAsA = s2r_thr_copy_a.partition_S(sA);  // ? (CPY, CPY_M, CPY_K, kStage)
@@ -86,18 +112,6 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   auto s2r_thr_copy_b = s2r_tiled_copy_b.get_slice(idx);
   auto tBsB = s2r_thr_copy_b.partition_S(sB);  // ? (CPY, CPY_M, CPY_K, kStage)
   auto tCrB_view = s2r_thr_copy_b.retile_D(tCrB);  // ? (CPY, CPY_M, CPY_K)
-
-  G2SCopyA g2s_tiled_copy_a;
-  auto g2s_thr_copy_a = g2s_tiled_copy_a.get_slice(idx);
-  auto tAgA_copy = g2s_thr_copy_a.partition_S(gA);  // (CPY, CPY_M, CPY_K, k)
-  auto tAsA_copy =
-      g2s_thr_copy_a.partition_D(sA);  // (CPY, CPY_M, CPY_K, kStage)
-
-  G2SCopyB g2s_tiled_copy_b;
-  auto g2s_thr_copy_b = g2s_tiled_copy_b.get_slice(idx);
-  auto tBgB_copy = g2s_thr_copy_b.partition_S(gB);  // (CPY, CPY_N, CPY_K, k)
-  auto tBsB_copy =
-      g2s_thr_copy_b.partition_D(sB);  // (CPY, CPY_N, CPY_K, kStage)
 
   int itile_to_read = 0;
   int ismem_read = 0;
@@ -246,6 +260,8 @@ struct GemmConfig {
   using mma_traits = MMA_Traits<mma_op>;
   using mma_atom = MMA_Atom<mma_traits>;
 
+  // EU means execution unit
+  // After repeating the MMA will deal with 32x16x16 sized mma
   static constexpr int kMmaEURepeatM = 2;
   static constexpr int kMmaEURepeatN = 2;
   static constexpr int kMmaEURepeatK = 1;
@@ -255,8 +271,7 @@ struct GemmConfig {
   static constexpr int kMmaPN = 2 * kMmaEURepeatN * get<1>(mma_atom_shape{});
   static constexpr int kMmaPK = 1 * kMmaEURepeatK * get<2>(mma_atom_shape{});
 
-  using MMA_EU_RepeatT = decltype(make_layout(make_shape(
-      Int<kMmaEURepeatM>{}, Int<kMmaEURepeatN>{}, Int<kMmaEURepeatK>{})));
+  using MMA_EU_RepeatT = decltype(make_layout(make_shape(Int<kMmaEURepeatM>{}, Int<kMmaEURepeatN>{}, Int<kMmaEURepeatK>{})));
   using MMA_P_T = Tile<Int<kMmaPM>, Int<kMmaPN>, Int<kMmaPK>>;
 
   using MMA = decltype(make_tiled_mma(mma_atom{}, MMA_EU_RepeatT{}, MMA_P_T{}));
@@ -265,11 +280,12 @@ struct GemmConfig {
   using g2s_copy_traits = Copy_Traits<g2s_copy_op>;
   using g2s_copy_atom = Copy_Atom<g2s_copy_traits, T>;
 
-  using G2SCopyA =
-      decltype(make_tiled_copy(g2s_copy_atom{},
-                               make_layout(make_shape(Int<32>{}, Int<4>{}),
-                                           make_stride(Int<4>{}, Int<1>{})),
-                               make_layout(make_shape(Int<1>{}, Int<8>{}))));
+  // Define the TiledCopy from global memory to shared memory
+  // Each Tile will copy 32x32 half_t elements
+  using G2SCopyA = decltype(make_tiled_copy(g2s_copy_atom{},
+                                            make_layout(make_shape(Int<32>{}, Int<4>{}),
+                                                        make_stride(Int<4>{}, Int<1>{})),
+                                            make_layout(make_shape(Int<1>{}, Int<8>{}))));
   using G2SCopyB = G2SCopyA;
 
   // shared memory to register copy
@@ -281,33 +297,30 @@ struct GemmConfig {
   using S2RCopyAtomB = s2r_copy_atom;
 
   // epilogue: register to global via shared memory
-  using SmemLayoutAtomC = decltype(composition(
-      Swizzle<2, 3, 3>{}, make_layout(make_shape(Int<kMmaPM>{}, Int<kMmaPN>{}),
-                                      make_stride(Int<kMmaPN>{}, Int<1>{}))));
-  using SmemLayoutC = decltype(tile_to_shape(
-      SmemLayoutAtomC{},
-      make_shape(Int<kMmaPM>{}, Int<kMmaPN>{}, Int<kSmemLayoutCBatch>{})));
+  using SmemLayoutAtomC = decltype(composition(Swizzle<2, 3, 3>{},
+                                               make_layout(make_shape(Int<kMmaPM>{}, Int<kMmaPN>{}), 
+                                                           make_stride(Int<kMmaPN>{}, Int<1>{}))));
+  using SmemLayoutC = decltype(tile_to_shape(SmemLayoutAtomC{},
+                               make_shape(Int<kMmaPM>{}, 
+                                          Int<kMmaPN>{}, 
+                                          Int<kSmemLayoutCBatch>{})));
 
-  static_assert(size<0>(SmemLayoutA{}) * size<1>(SmemLayoutA{}) >=
-                    size(SmemLayoutC{}),
+  static_assert(size<0>(SmemLayoutA{}) * size<1>(SmemLayoutA{}) >= size(SmemLayoutC{}),
                 "C shared memory request is large than A's one pipe");
 
   using R2SCopyAtomC = Copy_Atom<UniversalCopy<int>, T>;
 
   using S2GCopyAtomC = Copy_Atom<UniversalCopy<cute::uint128_t>, T>;
-  using S2GCopyC =
-      decltype(make_tiled_copy(S2GCopyAtomC{},
-                               make_layout(make_shape(Int<32>{}, Int<4>{}),
-                                           make_stride(Int<4>{}, Int<1>{})),
-                               make_layout(make_shape(Int<1>{}, Int<8>{}))));
+  using S2GCopyC = decltype(make_tiled_copy(S2GCopyAtomC{},
+                                            make_layout(make_shape(Int<32>{}, Int<4>{}),
+                                                        make_stride(Int<4>{}, Int<1>{})),
+                                            make_layout(make_shape(Int<1>{}, Int<8>{}))));
 
   static constexpr int kThreadNum = size(MMA{});
-  static constexpr int shm_size_AB =
-      cute::cosize(SmemLayoutA{}) + cute::cosize(SmemLayoutB{});
+  static constexpr int shm_size_AB = cute::cosize(SmemLayoutA{}) + cute::cosize(SmemLayoutB{});
   static constexpr int shm_size_C = cute::cosize(SmemLayoutC{});
 
-  static constexpr int kShmSize =
-      cute::max(shm_size_AB, shm_size_C) * sizeof(T);
+  static constexpr int kShmSize = cute::max(shm_size_AB, shm_size_C) * sizeof(T);
 };
 
 }  // namespace config
@@ -326,11 +339,11 @@ int main(int argc, char *argv[]) {
   printf("cuBLAS version: %d\n", cublas_version);
 
   // default;
-  int M = 5120;
-  int N = 5120;
-  int K = 4096;
+  int M = 128;
+  int N = 128;
+  int K = 64;
 
-  int num_iter = 100;
+  int num_iter = 1;
 
   using ComputeType = T;
 
@@ -372,7 +385,10 @@ int main(int argc, char *argv[]) {
 
   // gemm config
   config::GemmConfig<T, 128, 128, 32, 3> gemm_config;
-  print(typename decltype(gemm_config)::MMA{});
+  // config::GemmConfig<T, 128, 128, 32, 3>::G2SCopyA g2s_tiled_copy_a;
+  // print(g2s_tiled_copy_a);
+  // print_latex(g2s_tiled_copy_a);
+  // print(typename decltype(gemm_config)::MMA{});
 
   // kernel config
   dim3 block = gemm_config.kThreadNum;
