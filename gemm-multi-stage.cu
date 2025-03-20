@@ -63,11 +63,11 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   auto sA = make_tensor(make_smem_ptr(Ashm),
                         SmemLayoutA{});  // (kTileM, kTileK, kStage) (128, 32, 5)
   auto sB = make_tensor(make_smem_ptr(Bshm),
-                        SmemLayoutB{});  // (kTileN, kTileK, kStage) (128, 32, 5)
+                        SmemLayoutB{});  // (kTileN, kTileK, kStage) (128, 32, 5).
 
   // dispatch TileA/TileB/TileC mma tensor into thread fragment via partition
   // method
-  TiledMMA tiled_mma;
+  TiledMMA tiled_mma; // deal with (32, 16, 16) sized mma
   auto thr_mma = tiled_mma.get_slice(idx);
   auto tCrA = thr_mma.partition_fragment_A(gA(_, _, 0));  // (MMA, MMA_M, MMA_K), (8, 4, 2) = ((2,2,2), 128/32, 32/16)
   auto tCrB = thr_mma.partition_fragment_B(gB(_, _, 0));  // (MMA, MMA_N, MMA_K), (4, 8, 2) = ((2,2), 128/16, 32/16)
@@ -84,34 +84,47 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   // fill zero for accumulator
   clear(tCrD);
 
-  // gmem -cp.async-> shm
+  // gmem -cp.async-> shm, sA.shape = (128, 32, 5), gA.shape = (128, 32, k)
   G2SCopyA g2s_tiled_copy_a;
   auto g2s_thr_copy_a = g2s_tiled_copy_a.get_slice(idx);
   auto tAgA_copy = g2s_thr_copy_a.partition_S(gA);  // (CPY, CPY_M, CPY_K, k), (8, 4, 1, 1) = ((8,1), 128/32, 32/32, k)
   auto tAsA_copy = g2s_thr_copy_a.partition_D(sA);  // (CPY, CPY_M, CPY_K, kStage), (8, 4, 1, 3) = ((8,1), 128/32, 32/32, kStage)
   
-#if 0
+  G2SCopyB g2s_tiled_copy_b;
+  auto g2s_thr_copy_b = g2s_tiled_copy_b.get_slice(idx);
+  auto tBgB_copy = g2s_thr_copy_b.partition_S(gB);  // (CPY, CPY_N, CPY_K, k), (8, 4, 1, 1) = ((8,1), 128/32, 32/32, k)
+  auto tBsB_copy = g2s_thr_copy_b.partition_D(sB);  // (CPY, CPY_N, CPY_K, kStage) (8, 4, 1, 3) = ((8,1), 128/32, 32/32, kStage)
+
+#if 1
   if (thread0() && block0()) {
     print("tAgA_copy shape = "); print(tAgA_copy); print("\n");
     print("tAsA_copy shape = "); print(tAsA_copy); print("\n");
+    print("tBgB_copy shape = "); print(tBgB_copy); print("\n");
+    print("tBsB_copy shape = "); print(tBsB_copy); print("\n");
   }
 #endif
-
-  G2SCopyB g2s_tiled_copy_b;
-  auto g2s_thr_copy_b = g2s_tiled_copy_b.get_slice(idx);
-  auto tBgB_copy = g2s_thr_copy_b.partition_S(gB);  // (CPY, CPY_N, CPY_K, k)
-  auto tBsB_copy = g2s_thr_copy_b.partition_D(sB);  // (CPY, CPY_N, CPY_K, kStage)
   
-  // shm -ldmatrix-> reg
+  // shm -ldmatrix-> reg, sA.shape = (128, 32, 5)
+  // this seems similar to use tiled_mma to partition the tensor
   auto s2r_tiled_copy_a = make_tiled_copy_A(S2RCopyAtomA{}, tiled_mma);
   auto s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(idx);
-  auto tAsA = s2r_thr_copy_a.partition_S(sA);  // ? (CPY, CPY_M, CPY_K, kStage)
-  auto tCrA_view = s2r_thr_copy_a.retile_D(tCrA);  // ? (CPY, CPY_M, CPY_K)
+  auto tAsA = s2r_thr_copy_a.partition_S(sA);  // (CPY, CPY_M, CPY_K, kStage), (8, 4, 2, 3) = ((8,1), 128/32, 32/16, kStage)
+  auto tCrA_view = s2r_thr_copy_a.retile_D(tCrA);  // (CPY, CPY_M, CPY_K)
 
   auto s2r_tiled_copy_b = make_tiled_copy_B(S2RCopyAtomB{}, tiled_mma);
   auto s2r_thr_copy_b = s2r_tiled_copy_b.get_slice(idx);
   auto tBsB = s2r_thr_copy_b.partition_S(sB);  // ? (CPY, CPY_M, CPY_K, kStage)
   auto tCrB_view = s2r_thr_copy_b.retile_D(tCrB);  // ? (CPY, CPY_M, CPY_K)
+
+#if 0
+  if (thread0() && block0()) {
+    print("tAsA shape = "); print(tAsA); print("\n");
+    print("tCrA_view shape = "); print(tCrA_view); print("\n");
+    print("tBsB shape = "); print(tBsB); print("\n");
+    print("tCrB_view shape = "); print(tCrB_view); print("\n");
+  }
+#endif
+
 
   int itile_to_read = 0;
   int ismem_read = 0;
@@ -341,7 +354,7 @@ int main(int argc, char *argv[]) {
   // default;
   int M = 128;
   int N = 128;
-  int K = 64;
+  int K = 32;
 
   int num_iter = 1;
 
