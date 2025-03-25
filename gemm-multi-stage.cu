@@ -52,12 +52,9 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
                          make_stride(n, Int<1>{}));  // (M, N)
 
   // slice the tensor to small one which is used for current thread block.
-  Tensor gA = local_tile(A, make_tile(Int<kTileM>{}, Int<kTileK>{}),
-                         make_coord(iy, _));  // (kTileM, kTileK, k), (128, 32, 1)
-  Tensor gB = local_tile(B, make_tile(Int<kTileN>{}, Int<kTileK>{}),
-                         make_coord(ix, _));  // (kTileN, kTileK, k), (128, 32, 1)
-  Tensor gD = local_tile(D, make_tile(Int<kTileM>{}, Int<kTileN>{}),
-                         make_coord(iy, ix));  // (kTileM, kTileN), (128, 128)
+  Tensor gA = local_tile(A, make_tile(Int<kTileM>{}, Int<kTileK>{}), make_coord(iy, _));  // (kTileM, kTileK, k), (128, 32, 1)
+  Tensor gB = local_tile(B, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(ix, _));  // (kTileN, kTileK, k), (128, 32, 1)
+  Tensor gD = local_tile(D, make_tile(Int<kTileM>{}, Int<kTileN>{}), make_coord(iy, ix)); // (kTileM, kTileN), (128, 128)
 
   // shared memory
   auto sA = make_tensor(make_smem_ptr(Ashm),
@@ -95,7 +92,7 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   auto tBgB_copy = g2s_thr_copy_b.partition_S(gB);  // (CPY, CPY_N, CPY_K, k), (8, 4, 1, 1) = ((8,1), 128/32, 32/32, k)
   auto tBsB_copy = g2s_thr_copy_b.partition_D(sB);  // (CPY, CPY_N, CPY_K, kStage) (8, 4, 1, 3) = ((8,1), 128/32, 32/32, kStage)
 
-#if 1
+#if 0
   if (thread0() && block0()) {
     print("tAgA_copy shape = "); print(tAgA_copy); print("\n");
     print("tAsA_copy shape = "); print(tAsA_copy); print("\n");
@@ -109,7 +106,8 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   auto s2r_tiled_copy_a = make_tiled_copy_A(S2RCopyAtomA{}, tiled_mma);
   auto s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(idx);
   auto tAsA = s2r_thr_copy_a.partition_S(sA);  // (CPY, CPY_M, CPY_K, kStage), (8, 4, 2, 3) = ((8,1), 128/32, 32/16, kStage)
-  auto tCrA_view = s2r_thr_copy_a.retile_D(tCrA);  // (CPY, CPY_M, CPY_K)
+                                               // 8 * 128 != 32 * 16, this means, there are elements repeated in the copy process
+  auto tCrA_view = s2r_thr_copy_a.retile_D(tCrA);  // (CPY, CPY_M, CPY_K), (8, 4, 2) = ((8,1), 128/32, 32/16)
 
   auto s2r_tiled_copy_b = make_tiled_copy_B(S2RCopyAtomB{}, tiled_mma);
   auto s2r_thr_copy_b = s2r_tiled_copy_b.get_slice(idx);
@@ -130,8 +128,8 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   int ismem_read = 0;
   int ismem_write = 0;
 
-  // submit kStage - 1 tile
-  // gmem -> shm
+  // submit kStage - 1 tile, gmem -> shm
+  // what happens if istage is bigger than COPY_K?
 #pragma unroll
   for (int istage = 0; istage < kStage - 1; ++istage) {
     cute::copy(g2s_tiled_copy_a, tAgA_copy(_, _, _, istage),
@@ -153,72 +151,90 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   cute::copy(s2r_tiled_copy_a, tAsA(_, _, ik, ismem_read), tCrA_view(_, _, ik));
   cute::copy(s2r_tiled_copy_b, tBsB(_, _, ik, ismem_read), tCrB_view(_, _, ik));
 
+  // I assume the pipelined loop will be represented as a high level API in cutlass, so that we can focus on the algorithm itself
   // loop over k: i. load tile, ii. mma
   int ntile = k / kTileK;
 #pragma unroll 1
   for (int itile = 0; itile < ntile; ++itile) {
+    // this nk is what we called small k iter = kTileK // MMA_Tile_K
+    // where as big k iter = ntile
     int nk = size<2>(tCrA);
 
 #pragma unroll
     for (int ik = 0; ik < nk; ++ik) {
+      // To make it easier to understand, inside this loop,
+      // the ik usually means the small k iter
       int ik_next = (ik + 1) % nk;
 
+      if (ik == 0) {
+        // if this is the first small k iter, load the next tile of the big k iter
+        // why we don't load this when we submit the first kStage - 1 tile?
+        if (itile_to_read < ntile) {
+          cute::copy(g2s_tiled_copy_a, tAgA_copy(_, _, _, itile_to_read), tAsA_copy(_, _, _, ismem_write));
+          cute::copy(g2s_tiled_copy_b, tBgB_copy(_, _, _, itile_to_read), tBsB_copy(_, _, _, ismem_write));
+          cp_async_fence();
+          
+          ++itile_to_read;
+          ismem_write = (ismem_write + 1) % kStage;
+        }
+      }
+
       if (ik == nk - 1) {
+        // if this is the last small k iter, make sure the next big k iter is ready to be loaded.
         cp_async_wait<kStage - 2>();
         __syncthreads();
 
         ismem_read = (ismem_read + 1) % kStage;
       }
 
-      // shm -> reg s[itile][ik + 1] -> r[ik + 1]
-      cute::copy(s2r_tiled_copy_a, tAsA(_, _, ik_next, ismem_read),
-                 tCrA_view(_, _, ik_next));
-      cute::copy(s2r_tiled_copy_b, tBsB(_, _, ik_next, ismem_read),
-                 tCrB_view(_, _, ik_next));
+      // shm -> reg s[itile][ik + 1] -> r[ik + 1], this is asynchronous
+      cute::copy(s2r_tiled_copy_a, tAsA(_, _, ik_next, ismem_read), tCrA_view(_, _, ik_next));
+      cute::copy(s2r_tiled_copy_b, tBsB(_, _, ik_next, ismem_read), tCrB_view(_, _, ik_next));
 
-      if (ik == 0) {
-        if (itile_to_read < ntile) {
-          cute::copy(g2s_tiled_copy_a, tAgA_copy(_, _, _, itile_to_read),
-                     tAsA_copy(_, _, _, ismem_write));
-          cute::copy(g2s_tiled_copy_b, tBgB_copy(_, _, _, itile_to_read),
-                     tBsB_copy(_, _, _, ismem_write));
-
-          ++itile_to_read;
-          ismem_write = (ismem_write + 1) % kStage;
-        }
-
-        cp_async_fence();
-      }
-
+      // how do we know the tCrA and tCrB are ready to be used?
       cute::gemm(tiled_mma, tCrD, tCrA(_, _, ik), tCrB(_, _, ik), tCrD);
     }  // for ik
   }    // itile
 
   // use less shared memory as a scratchpad tile to use large wide instuction
   // Dreg -> shm -> reg -> global
-  auto sC = make_tensor(sA(_, _, ismem_read).data(), SmemLayoutC{});
+  auto sC = make_tensor(sA(_, _, ismem_read).data(), SmemLayoutC{});    // (128, 128, 2)
 
+  // still use tiled_mma's C layout to partition the tensor, just like s2r_tiled_copy_a
+  // in a warp perspective, one tiled copy would deal with (32, 32) sized matrix
+  // and it will iterate to copy the whole (128, 128) sized matrix
   auto r2s_tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
   auto r2s_thr_copy_c = r2s_tiled_copy_c.get_slice(idx);
-  auto tCrC_r2s = r2s_thr_copy_c.retile_S(tCrD);   // (CPY, CPY_M, CPY_N)
-  auto tCsC_r2s = r2s_thr_copy_c.partition_D(sC);  // (CPY, _1, _1, pipe)
+  auto tCrC_r2s = r2s_thr_copy_c.retile_S(tCrD);   // (CPY, CPY_M, CPY_N), (8, 4, 4) = ((2, (2, 2)), 128/32, 128/32)
+  auto tCsC_r2s = r2s_thr_copy_c.partition_D(sC);  // (CPY, _1, _1, pipe), (8, 1, 1, 2) = ((2, (2, 2)), 1, 1, pipe)
 
   S2GCopyC s2g_tiled_copy_c;
   auto s2g_thr_copy_c = s2g_tiled_copy_c.get_thread_slice(idx);
-  auto tCsC_s2g = s2g_thr_copy_c.partition_S(sC);  // (CPY, _1, _1, pipe)
-  auto tCgC_s2g = s2g_thr_copy_c.partition_D(gD);  // (CPY, CPY_M, CPY_N)
+  auto tCsC_s2g = s2g_thr_copy_c.partition_S(sC);  // (CPY, _1, _1, pipe), (8, 1, 2, 2) = ((8, 1), 1, 1, pipe)
+  auto tCgC_s2g = s2g_thr_copy_c.partition_D(gD);  // (CPY, CPY_M, CPY_N), (8, 4, 4) = ((8, 1), 128/32, 128/32)
 
-  auto tCgC_s2gx = group_modes<1, 3>(tCgC_s2g);  // (CPY_, CPY_MN)
-  auto tCrC_r2sx = group_modes<1, 3>(tCrC_r2s);  // (CPY_, CPY_MN)
+  auto tCgC_s2gx = group_modes<1, 3>(tCgC_s2g);  // (CPY_, CPY_MN), (8, 16) = ((8, 1), 128/32 * 128/32), why CPY_, it is the same as CPY
+  auto tCrC_r2sx = group_modes<1, 3>(tCrC_r2s);  // (CPY_, CPY_MN), (8, 16) = ((2, (2, 2)), 128/32 * 128/32)
 
-  int step = size<3>(tCsC_r2s);  // pipe
+#if 0
+  if (thread0() && block0()) {
+    print("tCrC_r2s shape = "); print(tCrC_r2s); print("\n");
+    print("tCsC_r2s shape = "); print(tCsC_r2s); print("\n");
+    print("tCsC_s2g shape = "); print(tCsC_s2g); print("\n");
+    print("tCgC_s2g shape = "); print(tCgC_s2g); print("\n");
+    print("tCgC_s2gx shape = "); print(tCgC_s2gx); print("\n");
+    print("tCrC_r2sx shape = "); print(tCrC_r2sx); print("\n");
+  }
+#endif
+
+  int step = size<3>(tCsC_r2s);  // pipe = 2
 #pragma unroll
-  for (int i = 0; i < size<1>(tCrC_r2sx); i += step) {
+  for (int i = 0; i < size<1>(tCrC_r2sx); i += step) {  // for (int i = 0; i < 16; i += 2), how does this make a difference with
+                                                        // for (int i = 0; i < 16; i += 1)
     // reg -> shm
 #pragma unroll
     for (int j = 0; j < step; ++j) {
-      // we add a temp tensor to cope with accumulator and output data type
-      // difference
+      // we add a temp tensor to cope with accumulator and output data type difference
       auto t = make_tensor_like<T>(tCrC_r2sx(_, i + j));
       cute::copy(tCrC_r2sx(_, i + j), t);
 
@@ -257,16 +273,13 @@ struct GemmConfig {
   static constexpr int kShmLoadSwizzleS = 3;
   static constexpr int kShmLoadSwizzleB = 3;
 
-  using SmemLayoutAtom = decltype(composition(
-      Swizzle<kShmLoadSwizzleB, kShmLoadSwizzleM, kShmLoadSwizzleS>{},
-      make_layout(make_shape(Int<8>{}, Int<kTileK>{}),
-                  make_stride(Int<kTileK>{}, Int<1>{}))));
-  using SmemLayoutA = decltype(
-      tile_to_shape(SmemLayoutAtom{},
-                    make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{})));
-  using SmemLayoutB = decltype(
-      tile_to_shape(SmemLayoutAtom{},
-                    make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})));
+  using SmemLayoutAtom = decltype(composition(Swizzle<kShmLoadSwizzleB, kShmLoadSwizzleM, kShmLoadSwizzleS>{},
+                                              make_layout(make_shape(Int<8>{}, Int<kTileK>{}),
+                                                          make_stride(Int<kTileK>{}, Int<1>{}))));
+  using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtom{},
+                                             make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{})));
+  using SmemLayoutB = decltype(tile_to_shape(SmemLayoutAtom{}, 
+                                             make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})));
 
   using mma_op = SM80_16x8x16_F16F16F16F16_TN;
 
@@ -314,9 +327,9 @@ struct GemmConfig {
                                                make_layout(make_shape(Int<kMmaPM>{}, Int<kMmaPN>{}), 
                                                            make_stride(Int<kMmaPN>{}, Int<1>{}))));
   using SmemLayoutC = decltype(tile_to_shape(SmemLayoutAtomC{},
-                               make_shape(Int<kMmaPM>{}, 
-                                          Int<kMmaPN>{}, 
-                                          Int<kSmemLayoutCBatch>{})));
+                                             make_shape(Int<kMmaPM>{}, 
+                                                        Int<kMmaPN>{}, 
+                                                        Int<kSmemLayoutCBatch>{})));
 
   static_assert(size<0>(SmemLayoutA{}) * size<1>(SmemLayoutA{}) >= size(SmemLayoutC{}),
                 "C shared memory request is large than A's one pipe");
@@ -398,6 +411,8 @@ int main(int argc, char *argv[]) {
 
   // gemm config
   config::GemmConfig<T, 128, 128, 32, 3> gemm_config;
+  // config::GemmConfig<T, 128, 128, 32, 3>::S2GCopyC s2g_tiled_copy_c;
+  // print(s2g_tiled_copy_c);
   // config::GemmConfig<T, 128, 128, 32, 3>::G2SCopyA g2s_tiled_copy_a;
   // print(g2s_tiled_copy_a);
   // print_latex(g2s_tiled_copy_a);

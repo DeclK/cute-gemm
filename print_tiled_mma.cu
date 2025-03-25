@@ -8,7 +8,7 @@ int main() {
 
     using MMA = decltype(make_tiled_mma(mma_atom{}, 
                         make_layout(Shape<_1, _1, _1>{}), 
-                        make_layout(Shape<_1, _1, _1>{})));
+                        Tile<_1, _1, _1>{}));
     MMA mma_tmp;
     print(mma_tmp);
 }
