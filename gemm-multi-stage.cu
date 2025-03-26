@@ -111,8 +111,8 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
 
   auto s2r_tiled_copy_b = make_tiled_copy_B(S2RCopyAtomB{}, tiled_mma);
   auto s2r_thr_copy_b = s2r_tiled_copy_b.get_slice(idx);
-  auto tBsB = s2r_thr_copy_b.partition_S(sB);  // ? (CPY, CPY_M, CPY_K, kStage)
-  auto tCrB_view = s2r_thr_copy_b.retile_D(tCrB);  // ? (CPY, CPY_M, CPY_K)
+  auto tBsB = s2r_thr_copy_b.partition_S(sB);  // ? (CPY, CPY_N, CPY_K, kStage), (8, 4, 2, 3) = ((8, 1), 128/32, 32/16, kStage)
+  auto tCrB_view = s2r_thr_copy_b.retile_D(tCrB);  // ? (CPY, CPY_N, CPY_K), (8, 4, 2) = ((8, 1), 128/32, 32/16)
 
 #if 0
   if (thread0() && block0()) {
